@@ -34,6 +34,55 @@ pub mod commands;
 
 const UNCOMMITTED_CHANGES_REF: &str = "refs/gitbutler/edit-uncommitted-changes";
 
+fn validate_edit_mode_rebase_plan(
+    ctx: &Context,
+    stack: &gitbutler_stack::Stack,
+    commit_oid: git2::Oid,
+) -> Result<()> {
+    let steps = stack.as_rebase_steps(ctx)?;
+    let target_commit = commit_oid.to_gix();
+
+    let mut seen_commits = HashSet::new();
+    let mut duplicate_picks = HashSet::new();
+    let mut target_occurrences = 0usize;
+
+    for step in &steps {
+        if let Some(commit_id) = step.commit_id() {
+            if commit_id == target_commit {
+                target_occurrences += 1;
+            }
+            if !seen_commits.insert(commit_id) {
+                duplicate_picks.insert(commit_id);
+            }
+        }
+    }
+
+    if target_occurrences != 1 {
+        bail!(
+            "Cannot enter edit mode for commit {}: it appears {} times in the stack rebase plan (expected exactly once). Saving would fail with a duplicate-pick error. Please report this as a GitButler bug and resolve a different conflicted commit first.",
+            &target_commit.to_string()[..7],
+            target_occurrences
+        );
+    }
+
+    if !duplicate_picks.is_empty() {
+        let mut duplicates: Vec<_> = duplicate_picks.into_iter().collect();
+        duplicates.sort();
+        let duplicate_list = duplicates
+            .into_iter()
+            .map(|oid| oid.to_string()[..7].to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        bail!(
+            "Cannot enter edit mode because the stack rebase plan contains duplicate commit picks: {}. Saving would fail with a duplicate-pick error. Please report this as a GitButler bug and avoid entering resolve mode for this stack until repaired.",
+            duplicate_list
+        );
+    }
+
+    Ok(())
+}
+
 /// Returns an index of the tree of `commit` if it is unconflicted, *or* produce a merged tree
 /// if `commit` is conflicted. That tree is turned into an index that records the conflicts that occurred
 /// during the merge.
@@ -261,7 +310,8 @@ pub(crate) fn enter_edit_mode(
 
     let vb_state = VirtualBranchesHandle::new(ctx.project_data_dir());
     // Validate the stack_id
-    vb_state.get_stack_in_workspace(stack_id)?;
+    let stack = vb_state.get_stack_in_workspace(stack_id)?;
+    validate_edit_mode_rebase_plan(ctx, &stack, commit.id())?;
 
     commit_uncommited_changes(ctx)?;
     write_edit_mode_metadata(ctx, &edit_mode_metadata).context("Failed to persist metadata")?;
